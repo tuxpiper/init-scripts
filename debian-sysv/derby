@@ -1,0 +1,228 @@
+#!/bin/sh
+#
+# /etc/init.d/derby -- startup script for Derby database daemon
+#
+#
+### BEGIN INIT INFO
+# Provides:          derby
+# Required-Start:    $local_fs $remote_fs $network
+# Required-Stop:     $local_fs $remote_fs $network
+# Should-Start:      $named
+# Should-Stop:       $named
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Start Derby.
+# Description:       Start Derby database daemon
+### END INIT INFO
+
+HOMEDIR=/opt/derby
+DERBY_USER=derby
+DERBY_GROUP=derby
+APPNAME=derby
+PRERUNCOMMAND=bin/setNetworkServerCP
+RUNCOMMAND=bin/startNetworkServer
+STOPCOMMAND=bin/stopNetworkServer
+LOGFILE=/var/log/derby.log
+
+DERBY_HOME=$HOMEDIR
+export DERBY_HOME
+DERBY_PID="/var/run/derby.pid"
+
+GREPSTRING='derbyclient.jar'
+
+if [ -r /etc/default/locale ]; then
+        . /etc/default/locale
+        export LANG
+fi
+
+. /lib/lsb/init-functions
+
+if [ -r /etc/default/rcS ]; then
+        . /etc/default/rcS
+fi
+
+
+if ! grep -qai "$DERBY_USER" /etc/passwd; then
+    echo "$DERBY_USER is not a user.  Please create a user account first" >&2
+    exit 1
+fi
+
+# this is a work-around until there is a suitable runtime replacement 
+# for dpkg-architecture for arch:all packages
+# this function sets the variable OPENJDKS
+find_openjdks()
+{
+        for jvmdir in /usr/lib/jvm/java-7-openjdk-*
+        do
+                if [ -d "${jvmdir}" -a "${jvmdir}" != "/usr/lib/jvm/java-7-openjdk-common" ]
+                then
+                        OPENJDKS=$jvmdir
+                fi
+        done
+        for jvmdir in /usr/lib/jvm/java-6-openjdk-*
+        do
+                if [ -d "${jvmdir}" -a "${jvmdir}" != "/usr/lib/jvm/java-6-openjdk-common" ]
+                then
+                        OPENJDKS="${OPENJDKS} ${jvmdir}"
+                fi
+        done
+}
+OPENJDKS=""
+find_openjdks
+# The first existing directory is used for JAVA_HOME (if JAVA_HOME is not
+# defined in $DEFAULT)
+JDK_DIRS="/usr/lib/jvm/default-java ${OPENJDKS} /usr/lib/jvm/java-6-openjdk /usr/lib/jvm/java-6-sun"
+
+# Look for the right JVM to use
+for jdir in $JDK_DIRS; do
+    if [ -r "$jdir/bin/java" -a -z "${JAVA_HOME}" ]; then
+        JAVA_HOME="$jdir"
+    fi
+done
+export JAVA_HOME
+
+if [ -z "$JAVA_OPTS" ]; then
+        JAVA_OPTS="-Djava.awt.headless=true -Xmx128M"
+fi
+
+
+start_derby() {
+    if [ ! -e "$LOGFILE" -a ! -e "`dirname \"$LOGFILE\"`" ]; then
+        mkdir -p `dirname "$LOGFILE"`
+    fi
+    if [ -e "$LOGFILE" ]; then
+        mv "$LOGFILE" "$LOGFILE".old
+    fi
+    touch $LOGFILE
+    chown $DERBY_USER $LOGFILE
+
+    chown -R $DERBY_USER $HOMEDIR
+    
+    DERBY_SH="set -a; JAVA_HOME=\"$JAVA_HOME\"; \
+                DERBY_HOME=\"$DERBY_HOME\"; \
+                CATALINA_BASE=\"$CATALINA_BASE\"; \
+                JAVA_OPTS=\"$JAVA_OPTS\"; \
+                DERBY_PID=\"$DERBY_PID\"; \
+                LANG=\"$LANG\"; \
+                cd \"$DERBY_HOME\"; \
+                . \"$PRERUNCOMMAND\"; \
+                . \"$RUNCOMMAND\" > \"$LOGFILE\" $@"
+    
+    set +e
+    start-stop-daemon --start -b -u "$DERBY_USER" -g "$DERBY_GROUP" \
+                -c "$DERBY_USER" -d "$HOMEDIR" -p "$DERBY_PID" -m \
+                -x /bin/bash -- --c "$DERBY_SH"
+    status="$?"
+    set +a -e
+    return $status
+}
+
+
+start() {
+    
+    log_daemon_msg "Starting $APPNAME"
+    if start-stop-daemon --test --start --pidfile "$DERBY_PID" \
+                --user $DERBY_USER --exec "$JAVA_HOME/bin/java" \
+                >/dev/null; then
+        start_derby
+        sleep 5
+        if start-stop-daemon --test --start --pidfile "$DERBY_PID" \
+            --user $DERBY_USER --exec "$JAVA_HOME/bin/java" \
+            >/dev/null; then
+            if [ -f "$CATALINA_PID" ]; then
+                rm -f "$CATALINA_PID"
+            fi
+            log_end_msg 1
+        else
+            log_end_msg 0
+        fi
+    else
+        log_progress_msg "(already running)"
+        log_end_msg 0
+    fi
+    
+}
+
+stop() {
+      
+    log_daemon_msg "Stopping $APPNAME"
+
+    set +e
+    su -c "$DERBY_HOME/$STOPCOMMAND" $DERBY_USER
+    sleep 5
+    
+    if [ -f "$DERBY_PID" ]; then 
+        start-stop-daemon --stop --pidfile "$DERBY_PID" \
+                --user "$DERBY_USER" \
+                --retry=TERM/20/KILL/5 >/dev/null
+        if [ $? -eq 1 ]; then
+                log_end_msg 0
+        elif [ $? -eq 3 ]; then
+                PID="`cat $CATALINA_PID`"
+                log_failure_msg "Failed to stop $APPNAME (pid $PID)"
+                exit 1
+        fi
+        rm -f "$DERBY_PID"
+    else
+        log_progress_msg "(not running)"
+    fi
+    log_end_msg 0
+    set -e
+
+}
+
+status() {
+
+    set +e
+    log_progress_msg "Checking status of $APPNAME"
+    start-stop-daemon --test --start --pidfile "$DERBY_PID" \
+        --user $DERBY_USER --exec "$JAVA_HOME/bin/java" \
+        >/dev/null 2>&1
+    if [ "$?" = "0" ]; then
+        if [ -f "$DERBY_PID" ]; then
+            log_success_msg "$APPNAME is not running, but pid file exists."
+            exit 1
+        else
+            log_success_msg "$APPNAME is not running."
+            exit 3
+        fi
+    else
+        log_success_msg "$APPNAME is running with pid `cat $CATALINA_PID`"
+    fi
+    set -e
+
+}
+
+case "$1" in
+start)
+    start
+    ;;
+stop)
+    stop
+    ;;
+status)
+    status
+    ;;
+restart|force-reload)
+    if [ -f "$CATALINA_PID" ]; then
+        $0 stop
+        sleep 1
+    fi
+    $0 start
+    ;;
+try-restart)
+    if start-stop-daemon --test --start --pidfile "$DERBY_PID" \
+        --user $DERBY_USER --exec "$JAVA_HOME/bin/java" \
+        >/dev/null; then
+        $0 start
+    fi
+    ;;
+*)
+    log_success_msg "Usage: $0 {start|stop|restart|try-restart|force-reload|status}"
+    exit 1
+    ;;
+esac
+
+exit 0
+
+
